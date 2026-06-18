@@ -86,6 +86,15 @@ void	arena_reset(t_arena *a)
 	a->offset = 0;
 }
 
+void	arena_destroy(t_arena *a)
+{
+	if (a && a->base)
+		munmap(a->base, a->capacity);
+	a->base = NULL;
+	a->offset = 0;
+	a->capacity = 0;
+}
+
 int main(void)
 {
 	t_arena a;
@@ -107,3 +116,7 @@ int main(void)
 	// question: do i need a munmap?
 	(void)0;
 }
+
+
+// something interesting: madvise(MADV_DONTNEED) : when? when i dont need the memory anymore, 
+// but i want to keep the mapping for later use. an real example scenario? e.g. a web server that handles multiple requests in a short period of time.
