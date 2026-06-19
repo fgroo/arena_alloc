@@ -42,8 +42,9 @@ typedef	struct s_arena
 	size_t			offset;
 	size_t			capacity;
 
-	size_t			last; // optional
-	void			*checkpoints[COUNT];
+	size_t			i;
+	size_t			prev; // optional
+	size_t			checkpoints[COUNT];
 }	t_arena;
 
 t_arena arena_create(size_t capacity)
@@ -57,6 +58,13 @@ t_arena arena_create(size_t capacity)
 	return a;
 }
 
+inline void arena_auto_checkpoint(t_arena *a, size_t offset)
+{
+	a->prev = offset;
+	a->checkpoints[a->i] = offset;
+	a->i++;
+}
+
 void	*arena_alloc(t_arena *a, size_t size, size_t alignment)
 {
 	size_t align = alignment ? alignment : sizeof(void*);
@@ -65,20 +73,21 @@ void	*arena_alloc(t_arena *a, size_t size, size_t alignment)
 		return perror("wrong use of arena_alloc\n"), (void *)NULL;
 	
 	void	*ptr = a->base + aligned;
-	a->last = a->offset;
+	arena_auto_checkpoint(a, a->offset);
 	a->offset = size + aligned;
 	return ptr;
 }
 
 
 
-void	*arena_restore(t_arena *a, size_t checkpoint) // TODO: doesent make any sense
+void	*arena_restore(t_arena *a, size_t checkpoint)
 {
-	if (!checkpoint || checkpoint > a->last)
+	if (!checkpoint || checkpoint > COUNT) // we predefined the amount of blocks we want to use - check the enum struct
 		return perror("wrong use of arena_restore\n"), (void*)NULL;
-	a->last = a->offset;
-	a->offset = a->last - ; // setting the offset of the selected checkpoint
-	return a->checkpoints[checkpoint];
+	a->prev = a->offset;
+	a->offset = a->checkpoints[checkpoint];
+	a->i = checkpoint; // we assume that everthing after the restored checkpoint is garbage
+	return (void*)(a->base + a->checkpoints[checkpoint]);
 }
 
 void	arena_reset(t_arena *a)
@@ -113,7 +122,7 @@ int main(void)
 		j++;
 	}
 	printf("%s\n", first_name_ptr);
-	// question: do i need a munmap?
+	arena_destroy(&a);
 	(void)0;
 }
 
