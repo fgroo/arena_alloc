@@ -22,6 +22,10 @@ void	arena_create(t_arena *a, size_t capacity, size_t checkpoint_slots)
 
 void	*arena_alloc(t_arena *a, size_t size, size_t alignment, size_t checkpoint_name)
 {
+	if (!a) {
+		perror("arena_alloc: wrong use of arena_alloc\n");
+		return NULL;
+	}
 	size_t align = alignment ? alignment : sizeof(void*);
 	size_t aligned = (a->offset + align - 1) & ~(align - 1);
 	if (aligned + size > a->capacity)
@@ -30,12 +34,8 @@ void	*arena_alloc(t_arena *a, size_t size, size_t alignment, size_t checkpoint_n
 	void *ptr = a->base + aligned;
 
 	// checkpoint logic
-	if (!checkpoint_name && a->checkpoint)
-		return perror("arena_alloc: you forgot to use checkpoint_name. check arena_create for second parameter\n"), static_cast<void *>(NULL);
-	if (checkpoint_name && !a->checkpoint)
-		return perror("arena_alloc: checkpoint not initialized\n"), static_cast<void *>(NULL);        
 	if (checkpoint_name && checkpoint_name >= a->checkpoint_slots)
-		return perror("arena_alloc: checkpoint capacity exceeded\n"), static_cast<void *>(NULL);
+		return perror("arena_alloc: checkpoint not initialized or capacity exceeded\n"), static_cast<void *>(NULL);
 	if (checkpoint_name && a->checkpoint && a->checkpoint[checkpoint_name])
 		return perror("arena_alloc: checkpoint already taken\n"), static_cast<void *>(NULL);
 	if (checkpoint_name && a->checkpoint && !a->checkpoint[checkpoint_name])
@@ -52,9 +52,10 @@ void	arena_reset(t_arena *a)
 		return;
 	}
 	if (a->checkpoint) {
-		for (size_t i = 0; i < a->checkpoint_slots; i++)
+		for (size_t i = 0; i < a->checkpoint_slots; i++) {
 			a->checkpoint[i] = 0;
-			a->checkpoint_slots = 0;
+		}
+		a->checkpoint_slots = 0;
 	}
 	a->prev = 0;
 	a->offset = 0;
@@ -81,7 +82,7 @@ void	arena_add_checkpoint(t_arena *a, size_t offset, size_t checkpoint_name)
 		return;
 	}
 	a->prev = offset;
-	a->checkpoint[checkpoint_name] = offset;
+	a->checkpoint[checkpoint_name] = offset + 1;   // +1: 0 stays reserved = "empty"
 }
 
 void	arena_print_checkpoint(t_arena *a)
@@ -91,17 +92,22 @@ void	arena_print_checkpoint(t_arena *a)
 		return;
 	}
 	for (size_t i = 0; i < a->checkpoint_slots; i++)
-		printf("checkpoint %zu: offset %zu (ptr %p)\n", i, a->checkpoint[i],
-			static_cast<void *>(a->base + a->checkpoint[i]));
+	{
+		if (!a->checkpoint[i])
+			printf("checkpoint %zu: (empty)\n", i);
+		else
+			printf("checkpoint %zu: offset %zu (ptr %p)\n", i, a->checkpoint[i] - 1,
+				static_cast<void *>(a->base + (a->checkpoint[i] - 1)));
+	}
 }
 
-void	*arena_restore(t_arena *a, size_t checkpoint) // checkpoints are the first indexes of the multiple blocks of memory in the arena
+void	*arena_restore_with_checkpoint(t_arena *a, size_t checkpoint) // checkpoints are the first indexes of the multiple blocks of memory in the arena
 {
-	if (!checkpoint || checkpoint >= a->checkpoint_slots) // if 0, just use arena_reset
-		return perror("arena_restore: wrong use of arena_restore\n"), static_cast<void *>(NULL);
+	if (!checkpoint || !a->checkpoint_slots || !a->checkpoint || checkpoint >= a->checkpoint_slots) // if 0, just use arena_reset
+		return perror("arena_restore_with_checkpoint: wrong use of arena_restore_with_checkpoint\n"), static_cast<void *>(NULL);
 	a->prev = a->offset;
-	a->offset = a->checkpoint[checkpoint]; 
-	return static_cast<void *>(a->base + a->checkpoint[checkpoint]);
+	a->offset = a->checkpoint[checkpoint] - 1;   // undo the +1 stored at add time
+	return static_cast<void *>(a->base + a->offset);
 }
 
 // something interesting: madvise(MADV_DONTNEED) : when? when i dont need the memory anymore, 

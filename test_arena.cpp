@@ -41,11 +41,17 @@ static const char *kEmailDomains[] = {
 
 // ---------------------------------------------------------------------------
 // Helpers
+//
+// The arena control struct must start zeroed (arena_create does not memset it),
+// so every test value-initialises it with `= t_arena()`.
+//
+// dup_str() takes an optional checkpoint name: omit it for plain bump allocs
+// (checkpoint_slots == 0), pass a name for checkpoint-tagged allocs.
 // ---------------------------------------------------------------------------
-static char *dup_str(t_arena *a, const char *s)
+static char *dup_str(t_arena *a, const char *s, size_t name = 0)
 {
 	size_t n = strlen(s) + 1;
-	char *p = static_cast<char*>(arena_alloc(a, n, sizeof(char)));
+	char *p = static_cast<char*>(arena_alloc(a, n, sizeof(char), name));
 	if (p) memcpy(p, s, n);
 	return p;
 }
@@ -56,11 +62,12 @@ static int is_aligned(const void *p, size_t align)
 }
 
 // ---------------------------------------------------------------------------
-// 1. Basic string interning
+// 1. Basic string interning (plain mode, no checkpoints)
 // ---------------------------------------------------------------------------
 static void test_string_intern(void)
 {
-	t_arena a = arena_create(1 << 16);
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 16, 0);
 	CHECK(a.base != NULL);
 
 	char *names[10];
@@ -74,11 +81,12 @@ static void test_string_intern(void)
 }
 
 // ---------------------------------------------------------------------------
-// 2. Alignment guarantees
+// 2. Alignment guarantees (plain mode)
 // ---------------------------------------------------------------------------
 static void test_alignment(void)
 {
-	t_arena a = arena_create(1 << 16);
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 16, 0);
 
 	size_t aligns[] = {1, 2, 4, 8, 16, 32, 64, 128};
 	for (size_t k = 0; k < sizeof(aligns)/sizeof(aligns[0]); k++) {
@@ -90,7 +98,7 @@ static void test_alignment(void)
 }
 
 // ---------------------------------------------------------------------------
-// 3. Record (struct) allocation + packing
+// 3. Record (struct) allocation + packing (plain mode)
 // ---------------------------------------------------------------------------
 struct Person {
 	char	first[16];
@@ -101,7 +109,8 @@ struct Person {
 
 static void test_struct_records(void)
 {
-	t_arena a = arena_create(1 << 16);
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 16, 0);
 
 	Person *people = static_cast<Person*>(
 		arena_alloc(&a, sizeof(Person) * 10, __alignof__(Person)));
@@ -123,60 +132,171 @@ static void test_struct_records(void)
 }
 
 // ---------------------------------------------------------------------------
-// 4. Checkpoint / restore (request-response scenario)
-//
-// NOTE on prototype semantics: arena_auto_checkpoint records the offset that
-// existed *before* the Nth allocation into checkpoints[N]. Because the CHKPT
-// enum maps name->index, allocations MUST happen in enum order for
-// arena_restore(a, REQUEST) to point at the right place.
-//   restore(N)  -> offset = checkpoints[N] = start of the Nth allocation,
-//                  i.e. allocations [0..N) are kept, [N..] are dropped.
+// 4. Plain mode is the default: omit checkpoint_name entirely.
+//    Verifies that checkpoint_slots == 0 => a plain bump allocator.
 // ---------------------------------------------------------------------------
-static void test_checkpoint_restore(void)
+static void test_plain_mode_optional(void)
 {
-	t_arena a = arena_create(1 << 16);
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 12, 0);
+	CHECK(a.checkpoint == NULL);
+	CHECK(a.checkpoint_slots == 0);
 
-	// allocate strictly in enum order so indices line up
-	char *fn   = dup_str(&a, kFirstNames[0]);           // i:0 -> FIRST_NAME
-	char *ln   = dup_str(&a, kLastNames[0]);            // i:1 -> LAST_NAME
-	char *cred = dup_str(&a, "basic dXNlcjpwdw==");      // i:2 -> CREDENTIALS
-	char *req  = dup_str(&a, "GET /users/42 HTTP/1.1");  // i:3 -> REQUEST
-	char *res  = dup_str(&a, "200 OK {\"id\":42}");      // i:4 -> RESPONSE
-	CHECK(fn && ln && cred && req && res);
+	char *p = dup_str(&a, kCities[0]);   // no 4th arg -> checkpoint_name defaults to 0
+	CHECK(p != NULL);
+	CHECK(strcmp(p, kCities[0]) == 0);
 
-	size_t req_start   = a.checkpoints[REQUEST];
-	size_t res_start   = a.checkpoints[RESPONSE];
-	CHECK(req_start < res_start && res_start < a.offset);
+	// arena_alloc with an explicit checkpoint_name in a no-checkpoint arena fails
+	CHECK(arena_alloc(&a, 16, 8, 1) == NULL);
 
-	// restore(RESPONSE): drop only the response, keep the request
-	void *p1 = arena_restore(&a, RESPONSE);
-	CHECK(p1 != NULL);
-	CHECK(a.offset == res_start);
-	CHECK(strcmp(req, "GET /users/42 HTTP/1.1") == 0); // request still intact
-
-	// restore(REQUEST): drop request and response, rewind to request start
-	void *p2 = arena_restore(&a, REQUEST);
-	CHECK(p2 != NULL);
-	CHECK(a.offset == req_start);
-
-	// re-use the reclaimed space for a new request
-	char *req2 = dup_str(&a, "POST /login");
-	CHECK(req2 != NULL);
-	CHECK((void*)req2 == (void*)(a.base + req_start));
-	CHECK(strcmp(req2, "POST /login") == 0);
-
-	// restore(0) / out-of-range are intentionally rejected by the prototype
-	CHECK(arena_restore(&a, 0) == NULL);
-	CHECK(arena_restore(&a, COUNT) == NULL);
 	arena_destroy(&a);
 }
 
 // ---------------------------------------------------------------------------
-// 5. arena_reset reuses whole buffer
+// 5. Checkpoint / restore (request-response scenario)
+//
+// Slots are named dynamically: create with N slots, then tag each allocation
+// with any name in [1, N). Names need not be sequential and need not match
+// allocation order. restore(name) rewinds to the offset recorded at that name.
+//
+// NOTE: a name can only be used once ("already taken" guard). Slot 0 is
+// reserved (0 means "no checkpoint"); valid names are 1..N-1.
+// ---------------------------------------------------------------------------
+static void test_checkpoint_restore(void)
+{
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 16, 6);   // 6 slots -> valid names 1..5
+	CHECK(a.base != NULL);
+	CHECK(a.checkpoint != NULL);
+	CHECK(a.checkpoint_slots == 6);
+
+	char *fn   = dup_str(&a, kFirstNames[0],            1);
+	char *ln   = dup_str(&a, kLastNames[0],             2);
+	char *cred = dup_str(&a, "basic dXNlcjpwdw==",       3);
+	char *req  = dup_str(&a, "GET /users/42 HTTP/1.1",   4);
+	char *res  = dup_str(&a, "200 OK {\"id\":42}",       5);
+	CHECK(fn && ln && cred && req && res);
+
+	size_t req_off = a.checkpoint[4] - 1;   // -1: stored as offset+1
+	size_t res_off = a.checkpoint[5] - 1;
+	CHECK(req_off < res_off && res_off < a.offset);
+
+	// restore(name=5): drop only the response, keep the request
+	void *p1 = arena_restore_with_checkpoint(&a, 5);
+	CHECK(p1 != NULL);
+	CHECK(a.offset == res_off);
+	CHECK(strcmp(req, "GET /users/42 HTTP/1.1") == 0); // request still intact
+
+	// restore(name=4): drop request and response, rewind to request start
+	void *p2 = arena_restore_with_checkpoint(&a, 4);
+	CHECK(p2 != NULL);
+	CHECK(a.offset == req_off);
+
+	// out-of-range restores are rejected
+	CHECK(arena_restore_with_checkpoint(&a, 0) == NULL);
+	CHECK(arena_restore_with_checkpoint(&a, 6) == NULL);
+	arena_destroy(&a);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Dynamic naming: names can be assigned out of order.
+//    The recorded offset follows allocation order, not name order.
+// ---------------------------------------------------------------------------
+static void test_checkpoint_dynamic_names(void)
+{
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 16, 5);   // valid names 1..4
+
+	// assign names in non-sequential order: 3, then 1, then 2
+	char *c = dup_str(&a, "gamma", 3);   // allocated first  -> smallest offset
+	char *b = dup_str(&a, "alpha", 1);   // allocated second -> middle offset
+	char *d = dup_str(&a, "beta",  2);   // allocated third  -> largest offset
+	CHECK(c && b && d);
+
+	// offsets follow allocation order, regardless of the name chosen
+	CHECK(a.checkpoint[3] < a.checkpoint[1]);
+	CHECK(a.checkpoint[1] < a.checkpoint[2]);
+
+	// restore to name 1: drops the name-2 alloc ("beta"); "alpha"(1) and
+	// "gamma"(3, before the restore point) stay valid.
+	size_t off1 = a.checkpoint[1] - 1;   // -1: stored as offset+1
+	void *p = arena_restore_with_checkpoint(&a, 1);
+	CHECK(p != NULL);
+	CHECK(a.offset == off1);
+	CHECK(strcmp(c, "gamma") == 0);   // before restore point -> intact
+	arena_destroy(&a);
+}
+
+// ---------------------------------------------------------------------------
+// 7. A checkpoint name can only be taken once per arena lifetime.
+// ---------------------------------------------------------------------------
+static void test_checkpoint_already_taken(void)
+{
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 16, 5);
+
+	char *first = dup_str(&a, "one", 1);
+	CHECK(first != NULL);
+
+	// reusing name 1 must fail
+	CHECK(dup_str(&a, "two", 1) == NULL);
+
+	// a fresh name still works
+	CHECK(dup_str(&a, "three", 2) != NULL);
+	arena_destroy(&a);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Boundary / out-of-range checks in checkpoint mode.
+// ---------------------------------------------------------------------------
+static void test_checkpoint_out_of_range(void)
+{
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 16, 3);   // valid names 1,2
+
+	// name 0 always means "plain alloc, no tag" — allowed even in checkpoint mode
+	CHECK(dup_str(&a, "x", 0) != NULL);
+	// name == slots => out of range
+	CHECK(dup_str(&a, "x", 3) == NULL);
+	// name > slots => out of range
+	CHECK(dup_str(&a, "x", 99) == NULL);
+
+	// valid name works
+	CHECK(dup_str(&a, "ok", 1) != NULL);
+
+	// restore out of range rejected
+	CHECK(arena_restore_with_checkpoint(&a, 0) == NULL);
+	CHECK(arena_restore_with_checkpoint(&a, 3) == NULL);
+	arena_destroy(&a);
+}
+
+// ---------------------------------------------------------------------------
+// 9. arena_print_checkpoint runs without crashing and covers every slot.
+// ---------------------------------------------------------------------------
+static void test_checkpoint_print(void)
+{
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 16, 4);
+
+	dup_str(&a, "first",  1);
+	dup_str(&a, "second", 2);
+
+	arena_print_checkpoint(&a);   // should print slots 0..3 (0 unused)
+
+	CHECK(a.checkpoint[1] != 0);
+	CHECK(a.checkpoint[2] != 0);
+	CHECK(a.checkpoint[0] == 0);  // slot 0 never used
+	CHECK(a.checkpoint[3] == 0);  // never tagged
+	arena_destroy(&a);
+}
+
+// ---------------------------------------------------------------------------
+// 10. arena_reset reuses whole buffer (plain mode)
 // ---------------------------------------------------------------------------
 static void test_reset(void)
 {
-	t_arena a = arena_create(1 << 12);
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 12, 0);
 	for (int i = 0; i < 5; i++) dup_str(&a, kCities[i]);
 	CHECK(a.offset > 0);
 
@@ -190,11 +310,12 @@ static void test_reset(void)
 }
 
 // ---------------------------------------------------------------------------
-// 6. Capacity overflow must fail safely
+// 11. Capacity overflow must fail safely
 // ---------------------------------------------------------------------------
 static void test_overflow(void)
 {
-	t_arena a = arena_create(128);
+	t_arena a = t_arena();
+	arena_create(&a, 128, 0);
 	CHECK(a.base != NULL);
 
 	void *ok = arena_alloc(&a, 64, 1);
@@ -209,11 +330,12 @@ static void test_overflow(void)
 }
 
 // ---------------------------------------------------------------------------
-// 7. Many small allocations (packing + checkpoint table bound)
+// 12. Many small allocations (packing; plain mode so there is no slot limit)
 // ---------------------------------------------------------------------------
 static void test_stress_small(void)
 {
-	t_arena a = arena_create(1 << 20);   // 1 MiB
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 20, 0);   // 1 MiB
 	int n = 5000;
 	int ok = 0;
 	for (int i = 0; i < n; i++) {
@@ -226,11 +348,12 @@ static void test_stress_small(void)
 }
 
 // ---------------------------------------------------------------------------
-// 8. Mixed-type workload (realistic-ish)
+// 13. Mixed-type workload (realistic-ish, plain mode)
 // ---------------------------------------------------------------------------
 static void test_mixed_workload(void)
 {
-	t_arena a = arena_create(1 << 16);
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 16, 0);
 
 	char *fn = dup_str(&a, kFirstNames[4]);
 	char *ln = dup_str(&a, kLastNames[5]);
@@ -250,11 +373,12 @@ static void test_mixed_workload(void)
 }
 
 // ---------------------------------------------------------------------------
-// 9. Zero-size / edge allocs
+// 14. Zero-size / edge allocs (plain mode)
 // ---------------------------------------------------------------------------
 static void test_edge_cases(void)
 {
-	t_arena a = arena_create(1 << 12);
+	t_arena a = t_arena();
+	arena_create(&a, 1 << 12, 0);
 	void *p1 = arena_alloc(&a, 0, 0);
 	CHECK(p1 != NULL);                  // zero size still returns a pointer
 	CHECK(is_aligned(p1, sizeof(void*)));
@@ -269,7 +393,12 @@ int main(void)
 	RUN_TEST(test_string_intern);
 	RUN_TEST(test_alignment);
 	RUN_TEST(test_struct_records);
+	RUN_TEST(test_plain_mode_optional);
 	RUN_TEST(test_checkpoint_restore);
+	RUN_TEST(test_checkpoint_dynamic_names);
+	RUN_TEST(test_checkpoint_already_taken);
+	RUN_TEST(test_checkpoint_out_of_range);
+	RUN_TEST(test_checkpoint_print);
 	RUN_TEST(test_reset);
 	RUN_TEST(test_overflow);
 	RUN_TEST(test_stress_small);
